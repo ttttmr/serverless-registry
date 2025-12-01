@@ -1,7 +1,5 @@
 import { Authenticator, AuthenticatorCheckCredentialsResponse, stripUsernamePasswordFromHeader } from "./auth";
 import { errorString } from "./utils";
-import { RegistryTokens } from "./token";
-import type { RegistryTokenCapability } from "./auth";
 
 export const SHA256_PREFIX = "sha256";
 export const SHA256_PREFIX_LEN = SHA256_PREFIX.length + 1; // add ":"
@@ -12,7 +10,7 @@ export function hexToDigest(sha256: ArrayBuffer, prefix: string = SHA256_PREFIX 
   return `${prefix}${digest}`;
 }
 
-function stringToArrayBuffer(s: string): ArrayBuffer {
+function stringToArrayBuffer(s: string): Uint8Array {
   const encoder = new TextEncoder();
   const arr = encoder.encode(s);
   return arr;
@@ -31,48 +29,71 @@ export async function getSHA256(data: string, prefix: string = SHA256_PREFIX + "
 export type AuthenticatorCredentials = {
   username: string;
   password: string;
-  capabilities: RegistryTokenCapability[];
 };
 
 export class UserAuthenticator implements Authenticator {
   authmode: string;
-  constructor(private credentials: AuthenticatorCredentials[]) {
+  constructor(private admin?: AuthenticatorCredentials) {
     this.authmode = "UserAuthenticator";
   }
 
   async checkCredentials(r: Request): Promise<AuthenticatorCheckCredentialsResponse> {
     const res = stripUsernamePasswordFromHeader(r);
+
+    // Default to pull access for everyone (anonymous or invalid credentials)
+    const pullOnlyResponse: AuthenticatorCheckCredentialsResponse = {
+      verified: true,
+      payload: {
+        username: "anonymous",
+        capabilities: ["pull"],
+        exp: Date.now() + 60 * 60,
+        aud: "",
+      },
+    };
+
+    if (!this.admin) {
+      // No admin configured -> Read-only for everyone
+      return pullOnlyResponse;
+    }
+
     if ("verified" in res) {
-      return res;
+      // No credentials or invalid header format -> Pull access
+      return pullOnlyResponse;
     }
 
     const [username, password] = res;
 
-    const credential = this.credentials.find((c) => c.username === username);
-    if (!credential) {
-      return { verified: false, payload: null };
-    }
-
     try {
-      if (!crypto.subtle.timingSafeEqual(stringToArrayBuffer(username), stringToArrayBuffer(credential.username))) {
-        return { verified: false, payload: null };
-      }
+      // Check if it matches the admin credentials
+      const usernameMatch = crypto.subtle.timingSafeEqual(
+        stringToArrayBuffer(username),
+        stringToArrayBuffer(this.admin.username)
+      );
 
-      if (!crypto.subtle.timingSafeEqual(stringToArrayBuffer(password), stringToArrayBuffer(credential.password))) {
-        return { verified: false, payload: null };
+      const passwordMatch = crypto.subtle.timingSafeEqual(
+        stringToArrayBuffer(password),
+        stringToArrayBuffer(this.admin.password)
+      );
+
+      if (usernameMatch && passwordMatch) {
+        // Admin -> Push + Pull access
+        return {
+          verified: true,
+          payload: {
+            username: this.admin.username,
+            capabilities: ["pull", "push"],
+            exp: Date.now() + 60 * 60,
+            aud: "",
+          },
+        };
       }
     } catch (err) {
       console.error(`Failed authentication timingSafeEqual: ${errorString(err)}`);
-      return { verified: false, payload: null };
+      // On error, fall back to pull access
+      return pullOnlyResponse;
     }
 
-    const payload = {
-      username,
-      capabilities: credential.capabilities,
-      exp: Date.now() + 60 * 60,
-      aud: "",
-    };
-
-    return RegistryTokens.verifyPayload(r, payload);
+    // Credentials provided but incorrect -> Pull access
+    return pullOnlyResponse;
   }
 }
